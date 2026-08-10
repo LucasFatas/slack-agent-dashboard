@@ -1,4 +1,4 @@
 node_modules/
 .DS_Store
-screenshots/
 scripts/node_modules/
+scripts/.cdn-cache/

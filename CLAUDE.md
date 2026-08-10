@@ -78,18 +78,17 @@ The validation helper (`scripts/validate.mjs`) handles the boilerplate: starts `
 - **Layout change?** → Full-page screenshot showing the new arrangement
 - **Fixed a bug?** → Screenshot showing the bug is gone (and describe what it looked like before)
 
-Write a validation script inline. Example:
+Write a validation script inline. Use `newPage()` (not `getBrowser()` directly) — it sets up CDN interception so Chart.js loads in the cloud VM. Example:
 
 ```javascript
-import { startDashboard, getBrowser, getScreenshotDir, stopDashboard } from
+import { startDashboard, newPage, getScreenshotDir, stopDashboard } from
   '~/slack-agent-dashboard/scripts/validate.mjs';
 import { join } from 'path';
 
-await startDashboard();
-const browser = await getBrowser();
+await startDashboard();  // starts wrangler dev + BQ refresh + CDN cache
 const dir = getScreenshotDir();
 
-const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+const page = await newPage();  // CDN interception pre-configured
 await page.goto('http://localhost:8787/commercial/sales');
 await page.waitForTimeout(3000);
 

@@ -1,56 +1,122 @@
 #!/usr/bin/env node
 /**
- * Dashboard validation helper.
+ * Dashboard visual validation helper.
  *
  * Handles the boilerplate: starts wrangler dev, refreshes data from BigQuery,
- * provides a ready-to-use Playwright browser. The AGENT writes the actual
- * validation logic (which pages to visit, what interactions to perform,
- * which screenshots to take).
+ * pre-fetches CDN dependencies (Chart.js etc.) that the cloud VM can't reach,
+ * provides a ready-to-use Playwright browser with CDN interception.
  *
- * Usage — the agent runs this as a library, not a CLI tool.
- * The agent writes a validation script per change, e.g.:
+ * The AGENT writes the actual validation logic per change.
  *
- *   import { startDashboard, stopDashboard, getBrowser } from './validate.mjs';
- *
- *   await startDashboard();  // starts wrangler dev + BQ refresh
- *   const browser = await getBrowser();
- *   const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
- *
- *   // Navigate and take targeted screenshots
+ * Library usage:
+ *   import { startDashboard, newPage, screenshot, stopDashboard } from './validate.mjs';
+ *   await startDashboard();
+ *   const page = await newPage();
  *   await page.goto('http://localhost:8787/commercial/sales');
- *   await page.screenshot({ path: 'screenshots/sales-default.png', fullPage: true });
- *
- *   // Test a filter interaction
- *   await page.click('[data-filter="EMEA"]');
- *   await page.waitForTimeout(1000);
- *   await page.screenshot({ path: 'screenshots/sales-emea-filter.png', fullPage: true });
- *
+ *   await page.screenshot({ path: 'screenshots/sales.png', fullPage: true });
  *   await stopDashboard();
  *
- * Can also be used as a CLI for simple full-page screenshots:
- *   node validate.mjs /commercial/sales /demandgen/overview
+ * CLI usage:
+ *   node validate.mjs /commercial/sales /commercial/marketing
  *   node validate.mjs --all
  */
 
 import { chromium } from "playwright";
-import { spawn } from "child_process";
-import { mkdir, writeFile, access } from "fs/promises";
-import { dirname, join } from "path";
+import { spawn, execSync } from "child_process";
+import { mkdir, writeFile, access, readFile } from "fs/promises";
+import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
+import { existsSync } from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || join(__dirname, "..", "screenshots");
+const CDN_CACHE_DIR = join(__dirname, ".cdn-cache");
 const PORT = process.env.VALIDATE_PORT || 8787;
-const WRANGLER_STARTUP_MS = 8000;
+const WRANGLER_STARTUP_MS = 10000;
 
 let _wrangler = null;
 let _browser = null;
+let _cdnCache = {};  // url → Buffer
+
+// CDN URLs the dashboards depend on that may be blocked in the cloud VM
+const CDN_DEPS = [
+  "https://cdn.jsdelivr.net/npm/chart.js",
+  "https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels",
+];
+
+// ─── CDN pre-fetch ───────────────────────────────────────────────────────────
+
+async function prefetchCdnDeps() {
+  await mkdir(CDN_CACHE_DIR, { recursive: true });
+
+  for (const url of CDN_DEPS) {
+    const filename = url.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const cachePath = join(CDN_CACHE_DIR, filename);
+
+    if (existsSync(cachePath)) {
+      _cdnCache[url] = await readFile(cachePath);
+      continue;
+    }
+
+    try {
+      // curl works through the proxy; fetch in Node may not
+      execSync(`curl -sL -o "${cachePath}" "${url}"`, { timeout: 15000 });
+      _cdnCache[url] = await readFile(cachePath);
+      console.log(`[validate] Cached CDN: ${url}`);
+    } catch {
+      console.log(`[validate] Warning: couldn't fetch ${url} — charts may not render`);
+    }
+  }
+}
+
+/**
+ * Set up CDN interception on a Playwright page.
+ * Intercepts requests to blocked CDN URLs and serves them from the local cache.
+ */
+async function setupCdnInterception(page) {
+  if (Object.keys(_cdnCache).length === 0) return;
+
+  await page.route("**/*", async (route) => {
+    const reqUrl = route.request().url();
+
+    // Check if this request matches a cached CDN URL
+    for (const [cdnUrl, body] of Object.entries(_cdnCache)) {
+      if (reqUrl.startsWith(cdnUrl) || reqUrl.includes(new URL(cdnUrl).pathname)) {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/javascript",
+          body,
+        });
+        return;
+      }
+    }
+
+    await route.continue();
+  });
+}
+
+// ─── Chromium discovery ──────────────────────────────────────────────────────
+
+function findChromium() {
+  // Cloud VMs may have Chromium at /opt/pw-browsers or a custom path
+  const candidates = [
+    "/opt/pw-browsers/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell",
+    "/opt/pw-browsers/chromium-headless-shell-1234/chrome-headless-shell-linux64/chrome-headless-shell",
+    "/opt/pw-browsers/chromium",
+  ];
+
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+
+  // Fall back to Playwright's bundled browser (works locally)
+  return undefined;
+}
 
 // ─── Library API ─────────────────────────────────────────────────────────────
 
 /**
  * Start wrangler dev and refresh data from BigQuery.
- * Call this once at the start of validation.
  */
 export async function startDashboard() {
   // Ensure .dev.vars exists
@@ -58,6 +124,7 @@ export async function startDashboard() {
     await access(".dev.vars");
   } catch {
     if (process.env.BQ_SA_KEY) {
+      console.log("[validate] Creating .dev.vars from BQ_SA_KEY env var...");
       await writeFile(".dev.vars", `BQ_SA_KEY=${process.env.BQ_SA_KEY}\nWEBHOOK_SECRET=validation\n`);
     } else {
       throw new Error("No .dev.vars and no BQ_SA_KEY env var.");
@@ -66,6 +133,9 @@ export async function startDashboard() {
 
   await mkdir(SCREENSHOT_DIR, { recursive: true });
 
+  // Pre-fetch CDN deps (Chart.js etc.)
+  await prefetchCdnDeps();
+
   // Start wrangler dev
   console.log("[validate] Starting wrangler dev...");
   _wrangler = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--local"], {
@@ -73,10 +143,10 @@ export async function startDashboard() {
     env: { ...process.env, NODE_ENV: "development" },
   });
 
-  // Wait for ready
   let ready = false;
   const onData = (d) => {
-    if (d.toString().includes("Ready on") || d.toString().includes("Listening on")) ready = true;
+    const s = d.toString();
+    if (s.includes("Ready on") || s.includes("Listening on")) ready = true;
   };
   _wrangler.stdout.on("data", onData);
   _wrangler.stderr.on("data", onData);
@@ -96,25 +166,43 @@ export async function startDashboard() {
   }
 
   await sleep(3000);
-  console.log("[validate] Dashboard ready at http://localhost:" + PORT);
+  console.log(`[validate] Dashboard ready at http://localhost:${PORT}`);
 }
 
 /**
- * Get a Playwright browser instance. Reuses the same browser across calls.
+ * Get a Playwright browser instance.
  */
 export async function getBrowser() {
   if (!_browser) {
-    _browser = await chromium.launch({ args: ["--no-sandbox"] });
+    const executablePath = findChromium();
+    _browser = await chromium.launch({
+      args: ["--no-sandbox"],
+      ...(executablePath ? { executablePath } : {}),
+    });
+    if (executablePath) console.log(`[validate] Using Chromium at ${executablePath}`);
   }
   return _browser;
 }
 
 /**
- * Convenience: take a full-page screenshot of a route.
+ * Create a new page with CDN interception already set up.
+ * Use this instead of browser.newPage() directly.
+ */
+export async function newPage(opts) {
+  const browser = await getBrowser();
+  const page = await browser.newPage({
+    viewport: { width: 1920, height: 1080 },
+    ...opts,
+  });
+  await setupCdnInterception(page);
+  return page;
+}
+
+/**
+ * Convenience: navigate to a route, wait for render, take a full-page screenshot.
  */
 export async function screenshot(route, filename) {
-  const browser = await getBrowser();
-  const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+  const page = await newPage();
   await page.goto(`http://localhost:${PORT}${route}`, { waitUntil: "networkidle", timeout: 30000 });
   await page.waitForTimeout(3000);
   const filepath = join(SCREENSHOT_DIR, filename || route.replace(/\//g, "_").replace(/^_/, "") + ".png");
@@ -124,16 +212,10 @@ export async function screenshot(route, filename) {
   return filepath;
 }
 
-/**
- * Get the base URL for the local dashboard.
- */
 export function getBaseUrl() {
   return `http://localhost:${PORT}`;
 }
 
-/**
- * Get the screenshots directory path.
- */
 export function getScreenshotDir() {
   return SCREENSHOT_DIR;
 }
@@ -157,13 +239,13 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// ─── CLI mode (simple full-page screenshots) ─────────────────────────────────
+// ─── CLI mode ────────────────────────────────────────────────────────────────
 
 const CORE_PAGES = [
   "/commercial/sales",
   "/commercial/ae-scorecard",
   "/commercial/demand-generation",
-  "/demandgen/overview",
+  "/commercial/marketing",
   "/okr",
   "/product-metrics",
   "/supply",
@@ -178,7 +260,6 @@ async function cli() {
   }
 
   const pages = args[0] === "--all" ? CORE_PAGES : args;
-
   await startDashboard();
 
   console.log(`\nTaking screenshots of ${pages.length} pages...`);
@@ -208,7 +289,6 @@ async function cli() {
   process.exit(failed.length > 0 ? 1 : 0);
 }
 
-// Run CLI if called directly
 if (process.argv[1] && process.argv[1].endsWith("validate.mjs") && process.argv.length > 2) {
   cli();
 }
