@@ -2,18 +2,25 @@
 /**
  * Dashboard visual validation helper.
  *
- * Handles the boilerplate: starts wrangler dev, refreshes data from BigQuery,
- * pre-fetches CDN dependencies (Chart.js etc.) that the cloud VM can't reach,
- * provides a ready-to-use Playwright browser with CDN interception.
+ * Handles ALL the cloud VM environment quirks so the agent only writes
+ * validation logic (which pages to visit, what to click, what to screenshot).
  *
- * The AGENT writes the actual validation logic per change.
+ * What this handles automatically:
+ * - Finds Chromium (pre-installed at /opt/pw-browsers in cloud VMs)
+ * - Starts wrangler dev as a child process (won't die when bash returns)
+ * - Refreshes BigQuery data via /api/run-refresh-now
+ * - Pre-fetches blocked CDN deps (Chart.js) via curl and intercepts in-browser
+ * - Bypasses the HTTP proxy for localhost connections
+ * - Uses NODE_EXTRA_CA_CERTS for BQ TLS in cloud VMs
+ * - Polls for data load instead of fixed timeouts (handles 36MB+ responses)
  *
- * Library usage:
- *   import { startDashboard, newPage, screenshot, stopDashboard } from './validate.mjs';
- *   await startDashboard();
- *   const page = await newPage();
- *   await page.goto('http://localhost:8787/commercial/sales');
- *   await page.screenshot({ path: 'screenshots/sales.png', fullPage: true });
+ * Library usage (agent writes this part):
+ *   import { startDashboard, newPage, screenshot, waitForData, stopDashboard } from './validate.mjs';
+ *   await startDashboard();            // handles everything above
+ *   const page = await newPage();      // CDN interception + proxy bypass pre-configured
+ *   await page.goto('http://localhost:8787/commercial/marketing/google');
+ *   await waitForData(page);           // polls until tables/charts have data
+ *   await page.screenshot({ path: 'screenshots/google.png', fullPage: true });
  *   await stopDashboard();
  *
  * CLI usage:
@@ -24,24 +31,28 @@
 import { chromium } from "playwright";
 import { spawn, execSync } from "child_process";
 import { mkdir, writeFile, access, readFile } from "fs/promises";
-import { dirname, join, resolve } from "path";
+import { dirname, join } from "path";
 import { fileURLToPath } from "url";
-import { existsSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || join(__dirname, "..", "screenshots");
 const CDN_CACHE_DIR = join(__dirname, ".cdn-cache");
 const PORT = process.env.VALIDATE_PORT || 8787;
-const WRANGLER_STARTUP_MS = 10000;
+const WRANGLER_STARTUP_MS = 15000;
+const DATA_POLL_MS = 30000;   // max time to wait for data to load on a page
+const RENDER_SETTLE_MS = 2000; // time for charts to finish animating after data loads
 
 let _wrangler = null;
 let _browser = null;
-let _cdnCache = {};  // url → Buffer
+let _cdnCache = {};
 
-// CDN URLs the dashboards depend on that may be blocked in the cloud VM
+// CDN URLs the dashboards load that are blocked in the cloud VM.
+// curl can reach these through the proxy; the browser cannot.
 const CDN_DEPS = [
   "https://cdn.jsdelivr.net/npm/chart.js",
   "https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels",
+  "https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation",
 ];
 
 // ─── CDN pre-fetch ───────────────────────────────────────────────────────────
@@ -59,29 +70,26 @@ async function prefetchCdnDeps() {
     }
 
     try {
-      // curl works through the proxy; fetch in Node may not
       execSync(`curl -sL -o "${cachePath}" "${url}"`, { timeout: 15000 });
-      _cdnCache[url] = await readFile(cachePath);
-      console.log(`[validate] Cached CDN: ${url}`);
+      const data = await readFile(cachePath);
+      if (data.length > 100) {  // sanity check — not a 403 error page
+        _cdnCache[url] = data;
+        console.log(`[validate] Cached CDN: ${url} (${(data.length / 1024).toFixed(0)}KB)`);
+      }
     } catch {
-      console.log(`[validate] Warning: couldn't fetch ${url} — charts may not render`);
+      console.log(`[validate] Warning: couldn't fetch ${url}`);
     }
   }
 }
 
-/**
- * Set up CDN interception on a Playwright page.
- * Intercepts requests to blocked CDN URLs and serves them from the local cache.
- */
-async function setupCdnInterception(page) {
-  if (Object.keys(_cdnCache).length === 0) return;
-
+async function setupPageInterception(page) {
   await page.route("**/*", async (route) => {
     const reqUrl = route.request().url();
 
-    // Check if this request matches a cached CDN URL
+    // Serve cached CDN deps
     for (const [cdnUrl, body] of Object.entries(_cdnCache)) {
-      if (reqUrl.startsWith(cdnUrl) || reqUrl.includes(new URL(cdnUrl).pathname)) {
+      const cdnPath = new URL(cdnUrl).pathname;
+      if (reqUrl.startsWith(cdnUrl) || reqUrl.includes(cdnPath)) {
         await route.fulfill({
           status: 200,
           contentType: "application/javascript",
@@ -91,6 +99,16 @@ async function setupCdnInterception(page) {
       }
     }
 
+    // Stub any remaining blocked CDN requests (prevent hangs)
+    if (reqUrl.includes("cdn.jsdelivr.net") || reqUrl.includes("cdnjs.cloudflare.com") || reqUrl.includes("unpkg.com")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/javascript",
+        body: "/* blocked CDN - stubbed */",
+      });
+      return;
+    }
+
     await route.continue();
   });
 }
@@ -98,38 +116,36 @@ async function setupCdnInterception(page) {
 // ─── Chromium discovery ──────────────────────────────────────────────────────
 
 function findChromium() {
-  // Try Playwright's default detection first (works locally)
-  try {
-    const result = execSync("npx playwright install --dry-run chromium 2>&1 || true", { encoding: "utf-8" });
-    // If Playwright already has a browser, it'll work without explicit path
-    if (result.includes("already installed")) return undefined;
-  } catch {}
-
-  // Cloud VMs may have Chromium at /opt/pw-browsers — scan for it
-  const searchDirs = ["/opt/pw-browsers", "/opt/google", "/usr/bin"];
-  const binNames = ["chrome-headless-shell", "chromium-browser", "chromium", "google-chrome"];
-
-  for (const dir of searchDirs) {
-    if (!existsSync(dir)) continue;
+  // Check PLAYWRIGHT_BROWSERS_PATH first (set in cloud VMs)
+  const pwPath = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  if (pwPath && existsSync(pwPath)) {
     try {
-      // Recursively find any matching binary
       const found = execSync(
-        `find "${dir}" -type f \\( ${binNames.map(n => `-name "${n}"`).join(" -o ")} \\) 2>/dev/null | head -1`,
+        `find "${pwPath}" -type f \\( -name "chrome-headless-shell" -o -name "chromium" -o -name "chrome" \\) 2>/dev/null | head -1`,
         { encoding: "utf-8" }
       ).trim();
-      if (found) {
-        console.log(`[validate] Found Chromium at ${found}`);
-        return found;
-      }
+      if (found) return found;
     } catch {}
   }
 
-  // Last resort: check PATH
+  // Scan common cloud VM locations
+  for (const dir of ["/opt/pw-browsers", "/opt/google", "/usr/bin"]) {
+    if (!existsSync(dir)) continue;
+    try {
+      const found = execSync(
+        `find "${dir}" -type f \\( -name "chrome-headless-shell" -o -name "chromium-browser" -o -name "chromium" -o -name "chrome" \\) 2>/dev/null | head -1`,
+        { encoding: "utf-8" }
+      ).trim();
+      if (found) return found;
+    } catch {}
+  }
+
+  // Fall back to PATH
   try {
-    const which = execSync("which chromium-browser || which chromium || which google-chrome 2>/dev/null", { encoding: "utf-8" }).trim();
-    if (which) return which;
+    return execSync("which chromium-browser || which chromium || which google-chrome 2>/dev/null", { encoding: "utf-8" }).trim();
   } catch {}
 
+  // Let Playwright try its default (works locally)
   return undefined;
 }
 
@@ -137,6 +153,7 @@ function findChromium() {
 
 /**
  * Start wrangler dev and refresh data from BigQuery.
+ * Must be called from the dashboard repo directory (product-metrics-dashboard).
  */
 export async function startDashboard() {
   // Ensure .dev.vars exists
@@ -153,49 +170,70 @@ export async function startDashboard() {
 
   await mkdir(SCREENSHOT_DIR, { recursive: true });
 
-  // Ensure dashboard dependencies are installed
-  try {
-    if (!existsSync("node_modules")) {
-      console.log("[validate] Installing dashboard dependencies...");
+  // Ensure dependencies installed
+  if (!existsSync("node_modules")) {
+    console.log("[validate] Installing dashboard dependencies...");
+    try {
       execSync("npm install", { stdio: "pipe", timeout: 60000 });
+    } catch (e) {
+      console.log(`[validate] npm install warning: ${e.message}`);
     }
-  } catch (e) {
-    console.log(`[validate] npm install warning: ${e.message}`);
   }
 
-  // Pre-fetch CDN deps (Chart.js etc.)
+  // Pre-fetch CDN deps
   await prefetchCdnDeps();
 
-  // Start wrangler dev
+  // Build wrangler env — inherit everything + ensure CA certs for BQ TLS
+  const wranglerEnv = { ...process.env, NODE_ENV: "development" };
+  // Cloud VMs have a CA bundle at /root/.ccr/ca-bundle.crt
+  if (existsSync("/root/.ccr/ca-bundle.crt") && !wranglerEnv.NODE_EXTRA_CA_CERTS) {
+    wranglerEnv.NODE_EXTRA_CA_CERTS = "/root/.ccr/ca-bundle.crt";
+  }
+
+  // Start wrangler dev as a child process (stays alive within this Node process)
   console.log("[validate] Starting wrangler dev...");
   _wrangler = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--local"], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, NODE_ENV: "development" },
+    env: wranglerEnv,
+    detached: false,  // dies with this process, not with bash
   });
 
+  // Wait for ready signal
   let ready = false;
   const onData = (d) => {
     const s = d.toString();
-    if (s.includes("Ready on") || s.includes("Listening on")) ready = true;
+    if (s.includes("Ready on") || s.includes("Listening on") || s.includes(`localhost:${PORT}`)) {
+      ready = true;
+    }
   };
   _wrangler.stdout.on("data", onData);
   _wrangler.stderr.on("data", onData);
 
   const start = Date.now();
   while (!ready && Date.now() - start < WRANGLER_STARTUP_MS) await sleep(500);
-  await sleep(2000);
+
+  // Verify wrangler is actually serving
+  let serving = false;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const resp = await fetch(`http://localhost:${PORT}/healthz`);
+      if (resp.ok) { serving = true; break; }
+    } catch {}
+    await sleep(1000);
+  }
+  if (!serving) console.log("[validate] Warning: wrangler may not be ready (healthz didn't respond)");
 
   // Refresh data from BigQuery
   console.log("[validate] Refreshing data from BigQuery...");
   try {
-    const resp = await fetch(`http://localhost:${PORT}/api/run-refresh-now`);
+    const resp = await fetch(`http://localhost:${PORT}/api/run-refresh-now`, { signal: AbortSignal.timeout(30000) });
     const result = await resp.json();
     console.log(`[validate] Refresh: ${result.ok ? "✓" : "⚠"} (${result.updatedAt || "no timestamp"})`);
   } catch (e) {
     console.log(`[validate] Refresh failed: ${e.message} — continuing with cached/seed data`);
   }
 
-  await sleep(3000);
+  await sleep(2000);
   console.log(`[validate] Dashboard ready at http://localhost:${PORT}`);
 }
 
@@ -206,17 +244,21 @@ export async function getBrowser() {
   if (!_browser) {
     const executablePath = findChromium();
     _browser = await chromium.launch({
-      args: ["--no-sandbox"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--proxy-bypass-list=localhost,127.0.0.1",  // don't proxy localhost
+      ],
       ...(executablePath ? { executablePath } : {}),
     });
-    if (executablePath) console.log(`[validate] Using Chromium at ${executablePath}`);
+    if (executablePath) console.log(`[validate] Using Chromium: ${executablePath}`);
   }
   return _browser;
 }
 
 /**
- * Create a new page with CDN interception already set up.
- * Use this instead of browser.newPage() directly.
+ * Create a new page with CDN interception and proxy bypass pre-configured.
  */
 export async function newPage(opts) {
   const browser = await getBrowser();
@@ -224,17 +266,50 @@ export async function newPage(opts) {
     viewport: { width: 1920, height: 1080 },
     ...opts,
   });
-  await setupCdnInterception(page);
+  await setupPageInterception(page);
   return page;
 }
 
 /**
- * Convenience: navigate to a route, wait for render, take a full-page screenshot.
+ * Wait for data to load on a page. Polls until tables have rows or charts
+ * have rendered, up to DATA_POLL_MS. Use after page.goto().
+ */
+export async function waitForData(page, timeoutMs = DATA_POLL_MS) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const hasData = await page.evaluate(() => {
+      // Check for table rows
+      const tables = document.querySelectorAll("table tbody tr, .data-table tr");
+      if (tables.length > 0) return true;
+      // Check for Chart.js canvases that have been drawn
+      const canvases = document.querySelectorAll("canvas");
+      for (const c of canvases) {
+        if (c.width > 0 && c.height > 0) return true;
+      }
+      // Check for metric values (KPI cards)
+      const metrics = document.querySelectorAll(".metric-value, .kpi-value, .stat-value");
+      for (const m of metrics) {
+        if (m.textContent.trim() && m.textContent.trim() !== "-" && m.textContent.trim() !== "0") return true;
+      }
+      return false;
+    });
+    if (hasData) {
+      await sleep(RENDER_SETTLE_MS);
+      return true;
+    }
+    await sleep(500);
+  }
+  console.log("[validate] Warning: data didn't load within timeout");
+  return false;
+}
+
+/**
+ * Convenience: navigate to a route, wait for data, take a full-page screenshot.
  */
 export async function screenshot(route, filename) {
   const page = await newPage();
-  await page.goto(`http://localhost:${PORT}${route}`, { waitUntil: "networkidle", timeout: 30000 });
-  await page.waitForTimeout(3000);
+  await page.goto(`http://localhost:${PORT}${route}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await waitForData(page);
   const filepath = join(SCREENSHOT_DIR, filename || route.replace(/\//g, "_").replace(/^_/, "") + ".png");
   await page.screenshot({ path: filepath, fullPage: true });
   await page.close();

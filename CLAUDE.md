@@ -206,6 +206,18 @@ Dashboard HTML → fetches /api/* → renders client-side
 - Crons: hourly product metrics, half-hourly finance/supplier alerts
 - `/api/run-refresh-now` — manual refresh trigger (queries BQ, populates KV)
 
+## Cloud VM environment quirks
+
+These apply when running in a Claude Code cloud routine. The validate.mjs helper handles all of them, but if you write validation code manually, be aware:
+
+- **Chromium is pre-installed** at `/opt/pw-browsers`. Do NOT run `npx playwright install`. Use the `newPage()` helper or pass `executablePath` from `findChromium()`.
+- **CDN is blocked** — `cdn.jsdelivr.net` (Chart.js etc.) is unreachable from the browser. The validate helper pre-fetches via `curl` (which works through the proxy) and intercepts browser requests. If you see blank charts, you're missing CDN interception.
+- **Proxy intercepts localhost** — Chromium must be launched with `--proxy-bypass-list=localhost,127.0.0.1` or API fetches from the browser to `localhost:8787` will fail with `ERR_CONNECTION_RESET`.
+- **TLS for BigQuery** — the wrangler dev process needs `NODE_EXTRA_CA_CERTS=/root/.ccr/ca-bundle.crt` to reach BigQuery. The validate helper sets this automatically.
+- **Large API responses** — some endpoints return 30MB+ (keywords). Don't use fixed timeouts. The `waitForData()` helper polls until tables/charts have data.
+- **Background processes** — bash calls that spawn background processes (`&`) will have those processes killed when the bash call returns. Keep wrangler dev alive by running it as a child process of your validation Node script, not as a separate bash background job.
+- **ESM imports** — if you write a standalone `.mjs` file in a temp directory, bare `import 'playwright'` won't resolve because there's no `node_modules` there. Either run from the agent repo directory or use `createRequire` to resolve from a known path.
+
 ## What NOT to do
 
 - Don't change wrangler.toml bindings or account_id
@@ -214,3 +226,4 @@ Dashboard HTML → fetches /api/* → renders client-side
 - Don't push to any branch other than `main` (Cloudflare only deploys from main)
 - Don't skip visual validation for HTML changes
 - Don't modify the BQ service account key or Cloudflare secrets
+- Don't run `npx playwright install` — Chromium is pre-installed
