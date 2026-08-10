@@ -98,18 +98,38 @@ async function setupCdnInterception(page) {
 // ─── Chromium discovery ──────────────────────────────────────────────────────
 
 function findChromium() {
-  // Cloud VMs may have Chromium at /opt/pw-browsers or a custom path
-  const candidates = [
-    "/opt/pw-browsers/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell",
-    "/opt/pw-browsers/chromium-headless-shell-1234/chrome-headless-shell-linux64/chrome-headless-shell",
-    "/opt/pw-browsers/chromium",
-  ];
+  // Try Playwright's default detection first (works locally)
+  try {
+    const result = execSync("npx playwright install --dry-run chromium 2>&1 || true", { encoding: "utf-8" });
+    // If Playwright already has a browser, it'll work without explicit path
+    if (result.includes("already installed")) return undefined;
+  } catch {}
 
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
+  // Cloud VMs may have Chromium at /opt/pw-browsers — scan for it
+  const searchDirs = ["/opt/pw-browsers", "/opt/google", "/usr/bin"];
+  const binNames = ["chrome-headless-shell", "chromium-browser", "chromium", "google-chrome"];
+
+  for (const dir of searchDirs) {
+    if (!existsSync(dir)) continue;
+    try {
+      // Recursively find any matching binary
+      const found = execSync(
+        `find "${dir}" -type f \\( ${binNames.map(n => `-name "${n}"`).join(" -o ")} \\) 2>/dev/null | head -1`,
+        { encoding: "utf-8" }
+      ).trim();
+      if (found) {
+        console.log(`[validate] Found Chromium at ${found}`);
+        return found;
+      }
+    } catch {}
   }
 
-  // Fall back to Playwright's bundled browser (works locally)
+  // Last resort: check PATH
+  try {
+    const which = execSync("which chromium-browser || which chromium || which google-chrome 2>/dev/null", { encoding: "utf-8" }).trim();
+    if (which) return which;
+  } catch {}
+
   return undefined;
 }
 
@@ -132,6 +152,16 @@ export async function startDashboard() {
   }
 
   await mkdir(SCREENSHOT_DIR, { recursive: true });
+
+  // Ensure dashboard dependencies are installed
+  try {
+    if (!existsSync("node_modules")) {
+      console.log("[validate] Installing dashboard dependencies...");
+      execSync("npm install", { stdio: "pipe", timeout: 60000 });
+    }
+  } catch (e) {
+    console.log(`[validate] npm install warning: ${e.message}`);
+  }
 
   // Pre-fetch CDN deps (Chart.js etc.)
   await prefetchCdnDeps();

@@ -4,7 +4,7 @@ You are the Workwize dashboard agent, triggered from Slack. You modify and maint
 
 ## How you're triggered
 
-A Cloudflare Worker fires your routine when someone @mentions the bot in Slack with the `dashboard:` prefix. The fire payload contains:
+A Cloudflare Worker fires your routine when someone @mentions the bot in Slack with the `dashboard:` prefix. The fire payload arrives in your session's initial prompt, wrapped in `<routine-fire-payload>` tags. It contains:
 
 ```
 channel:{channel_id}
@@ -12,6 +12,8 @@ thread_ts:{thread_timestamp}
 user:{slack_user_id}
 task: {the message text}
 ```
+
+Look for the `<routine-fire-payload>` block in your first message — that's where channel, thread_ts, and the task are. If no fire payload is present, this may be a manual "Run now" test — check the instructions text for context instead.
 
 ## Repo layout (two repos cloned)
 
