@@ -1,22 +1,35 @@
 #!/usr/bin/env node
 /**
- * Dashboard visual validation script.
+ * Dashboard validation helper.
  *
- * Starts wrangler dev, refreshes data from BigQuery, and takes
- * Playwright screenshots of the specified dashboard pages.
+ * Handles the boilerplate: starts wrangler dev, refreshes data from BigQuery,
+ * provides a ready-to-use Playwright browser. The AGENT writes the actual
+ * validation logic (which pages to visit, what interactions to perform,
+ * which screenshots to take).
  *
- * Usage:
+ * Usage — the agent runs this as a library, not a CLI tool.
+ * The agent writes a validation script per change, e.g.:
+ *
+ *   import { startDashboard, stopDashboard, getBrowser } from './validate.mjs';
+ *
+ *   await startDashboard();  // starts wrangler dev + BQ refresh
+ *   const browser = await getBrowser();
+ *   const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+ *
+ *   // Navigate and take targeted screenshots
+ *   await page.goto('http://localhost:8787/commercial/sales');
+ *   await page.screenshot({ path: 'screenshots/sales-default.png', fullPage: true });
+ *
+ *   // Test a filter interaction
+ *   await page.click('[data-filter="EMEA"]');
+ *   await page.waitForTimeout(1000);
+ *   await page.screenshot({ path: 'screenshots/sales-emea-filter.png', fullPage: true });
+ *
+ *   await stopDashboard();
+ *
+ * Can also be used as a CLI for simple full-page screenshots:
  *   node validate.mjs /commercial/sales /demandgen/overview
- *   node validate.mjs --all   (screenshots a core set of pages)
- *
- * Prerequisites:
- *   - Run from the product-metrics-dashboard repo directory
- *   - .dev.vars must exist with BQ_SA_KEY (the script creates it from env if missing)
- *   - Playwright + Chromium installed (npx playwright install chromium --with-deps)
- *
- * Output:
- *   Screenshots saved to the directory specified by SCREENSHOT_DIR env var,
- *   or ./screenshots/ relative to THIS script's directory.
+ *   node validate.mjs --all
  */
 
 import { chromium } from "playwright";
@@ -27,10 +40,124 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || join(__dirname, "..", "screenshots");
-const PORT = 8787;
+const PORT = process.env.VALIDATE_PORT || 8787;
 const WRANGLER_STARTUP_MS = 8000;
-const BQ_REFRESH_MS = 15000;
-const PAGE_RENDER_MS = 3000;
+
+let _wrangler = null;
+let _browser = null;
+
+// ─── Library API ─────────────────────────────────────────────────────────────
+
+/**
+ * Start wrangler dev and refresh data from BigQuery.
+ * Call this once at the start of validation.
+ */
+export async function startDashboard() {
+  // Ensure .dev.vars exists
+  try {
+    await access(".dev.vars");
+  } catch {
+    if (process.env.BQ_SA_KEY) {
+      await writeFile(".dev.vars", `BQ_SA_KEY=${process.env.BQ_SA_KEY}\nWEBHOOK_SECRET=validation\n`);
+    } else {
+      throw new Error("No .dev.vars and no BQ_SA_KEY env var.");
+    }
+  }
+
+  await mkdir(SCREENSHOT_DIR, { recursive: true });
+
+  // Start wrangler dev
+  console.log("[validate] Starting wrangler dev...");
+  _wrangler = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--local"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, NODE_ENV: "development" },
+  });
+
+  // Wait for ready
+  let ready = false;
+  const onData = (d) => {
+    if (d.toString().includes("Ready on") || d.toString().includes("Listening on")) ready = true;
+  };
+  _wrangler.stdout.on("data", onData);
+  _wrangler.stderr.on("data", onData);
+
+  const start = Date.now();
+  while (!ready && Date.now() - start < WRANGLER_STARTUP_MS) await sleep(500);
+  await sleep(2000);
+
+  // Refresh data from BigQuery
+  console.log("[validate] Refreshing data from BigQuery...");
+  try {
+    const resp = await fetch(`http://localhost:${PORT}/api/run-refresh-now`);
+    const result = await resp.json();
+    console.log(`[validate] Refresh: ${result.ok ? "✓" : "⚠"} (${result.updatedAt || "no timestamp"})`);
+  } catch (e) {
+    console.log(`[validate] Refresh failed: ${e.message} — continuing with cached/seed data`);
+  }
+
+  await sleep(3000);
+  console.log("[validate] Dashboard ready at http://localhost:" + PORT);
+}
+
+/**
+ * Get a Playwright browser instance. Reuses the same browser across calls.
+ */
+export async function getBrowser() {
+  if (!_browser) {
+    _browser = await chromium.launch({ args: ["--no-sandbox"] });
+  }
+  return _browser;
+}
+
+/**
+ * Convenience: take a full-page screenshot of a route.
+ */
+export async function screenshot(route, filename) {
+  const browser = await getBrowser();
+  const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+  await page.goto(`http://localhost:${PORT}${route}`, { waitUntil: "networkidle", timeout: 30000 });
+  await page.waitForTimeout(3000);
+  const filepath = join(SCREENSHOT_DIR, filename || route.replace(/\//g, "_").replace(/^_/, "") + ".png");
+  await page.screenshot({ path: filepath, fullPage: true });
+  await page.close();
+  console.log(`[validate] Screenshot: ${filepath}`);
+  return filepath;
+}
+
+/**
+ * Get the base URL for the local dashboard.
+ */
+export function getBaseUrl() {
+  return `http://localhost:${PORT}`;
+}
+
+/**
+ * Get the screenshots directory path.
+ */
+export function getScreenshotDir() {
+  return SCREENSHOT_DIR;
+}
+
+/**
+ * Stop wrangler dev and close the browser.
+ */
+export async function stopDashboard() {
+  if (_browser) {
+    await _browser.close();
+    _browser = null;
+  }
+  if (_wrangler) {
+    _wrangler.kill("SIGTERM");
+    _wrangler = null;
+  }
+  console.log("[validate] Stopped.");
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── CLI mode (simple full-page screenshots) ─────────────────────────────────
 
 const CORE_PAGES = [
   "/commercial/sales",
@@ -42,7 +169,7 @@ const CORE_PAGES = [
   "/supply",
 ];
 
-async function main() {
+async function cli() {
   const args = process.argv.slice(2);
   if (!args.length) {
     console.error("Usage: node validate.mjs /page1 /page2 ...");
@@ -52,110 +179,22 @@ async function main() {
 
   const pages = args[0] === "--all" ? CORE_PAGES : args;
 
-  // Ensure .dev.vars exists (create from env if missing)
-  try {
-    await access(".dev.vars");
-  } catch {
-    if (process.env.BQ_SA_KEY) {
-      console.log("Creating .dev.vars from BQ_SA_KEY env var...");
-      await writeFile(".dev.vars", `BQ_SA_KEY=${process.env.BQ_SA_KEY}\nWEBHOOK_SECRET=validation\n`);
-    } else {
-      console.error("ERROR: No .dev.vars and no BQ_SA_KEY env var. Cannot start worker with data.");
-      process.exit(1);
-    }
-  }
+  await startDashboard();
 
-  // Create screenshot directory
-  await mkdir(SCREENSHOT_DIR, { recursive: true });
-
-  // Start wrangler dev
-  console.log("Starting wrangler dev...");
-  const wrangler = spawn("npx", ["wrangler", "dev", "--port", String(PORT), "--local"], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, NODE_ENV: "development" },
-  });
-
-  // Log wrangler output for debugging
-  let wranglerReady = false;
-  wrangler.stdout.on("data", (d) => {
-    const line = d.toString();
-    if (line.includes("Ready on") || line.includes("Listening on")) {
-      wranglerReady = true;
-    }
-  });
-  wrangler.stderr.on("data", (d) => {
-    const line = d.toString();
-    if (line.includes("Ready on") || line.includes("Listening on")) {
-      wranglerReady = true;
-    }
-  });
-
-  // Wait for wrangler to start
-  const startTime = Date.now();
-  while (!wranglerReady && Date.now() - startTime < WRANGLER_STARTUP_MS) {
-    await sleep(500);
-  }
-  if (!wranglerReady) {
-    console.log("Wrangler didn't signal ready, proceeding anyway after timeout...");
-  }
-
-  // Extra buffer for stability
-  await sleep(2000);
-
-  // Trigger BigQuery refresh for real data
-  console.log("Refreshing data from BigQuery...");
-  try {
-    const refreshResp = await fetch(`http://localhost:${PORT}/api/run-refresh-now`);
-    const refreshResult = await refreshResp.json();
-    if (refreshResult.ok) {
-      console.log(`  ✓ Data refreshed (updatedAt: ${refreshResult.updatedAt})`);
-    } else {
-      console.log(`  ⚠ Refresh returned ok=false: ${JSON.stringify(refreshResult)}`);
-      console.log("  Continuing with seed/cached data...");
-    }
-  } catch (e) {
-    console.log(`  ⚠ Refresh failed: ${e.message}`);
-    console.log("  Continuing with seed/cached data...");
-  }
-
-  // Wait for data to settle in KV
-  await sleep(3000);
-
-  // Take screenshots
   console.log(`\nTaking screenshots of ${pages.length} pages...`);
-  const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const results = [];
-
   for (const pagePath of pages) {
-    const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
-    const url = `http://localhost:${PORT}${pagePath}`;
-
     try {
-      console.log(`  → ${pagePath}`);
-      await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
-      // Wait for client-side rendering (charts, tables)
-      await page.waitForTimeout(PAGE_RENDER_MS);
-
-      const filename = pagePath.replace(/\//g, "_").replace(/^_/, "") + ".png";
-      const filepath = join(SCREENSHOT_DIR, filename);
-      await page.screenshot({ path: filepath, fullPage: true });
-
+      const filepath = await screenshot(pagePath);
       results.push({ page: pagePath, file: filepath, status: "ok" });
-      console.log(`    ✓ ${filename}`);
     } catch (e) {
-      results.push({ page: pagePath, file: null, status: "error", error: e.message });
-      console.log(`    ✗ ${e.message}`);
+      results.push({ page: pagePath, status: "error", error: e.message });
+      console.log(`  ✗ ${pagePath}: ${e.message}`);
     }
-
-    await page.close();
   }
 
-  await browser.close();
+  await stopDashboard();
 
-  // Kill wrangler
-  wrangler.kill("SIGTERM");
-
-  // Summary
   console.log("\n--- Validation Summary ---");
   const ok = results.filter((r) => r.status === "ok");
   const failed = results.filter((r) => r.status === "error");
@@ -164,20 +203,12 @@ async function main() {
     console.log(`✗ ${failed.length} failed:`);
     for (const f of failed) console.log(`  - ${f.page}: ${f.error}`);
   }
-  console.log(`Screenshots saved to: ${SCREENSHOT_DIR}`);
-
-  // Output file list for Claude to read
-  console.log("\n--- Screenshot files ---");
-  for (const r of ok) console.log(r.file);
+  console.log(`Screenshots: ${SCREENSHOT_DIR}`);
 
   process.exit(failed.length > 0 ? 1 : 0);
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// Run CLI if called directly
+if (process.argv[1] && process.argv[1].endsWith("validate.mjs") && process.argv.length > 2) {
+  cli();
 }
-
-main().catch((e) => {
-  console.error("Validation failed:", e);
-  process.exit(1);
-});

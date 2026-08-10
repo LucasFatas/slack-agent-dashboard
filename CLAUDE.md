@@ -65,37 +65,87 @@ For any modified or new SQL query:
 3. If the query references tables, verify they exist
 
 #### d. Validate HTML changes visually
-**This is mandatory for any HTML/JS/CSS change.** Run the validation script:
 
-```bash
-cd ~/product-metrics-dashboard
-node ~/slack-agent-dashboard/scripts/validate.mjs /path/to/screenshot1 /path/to/screenshot2 ...
+**This is mandatory for any HTML/JS/CSS change.**
+
+The validation helper (`scripts/validate.mjs`) handles the boilerplate: starts `wrangler dev` locally, refreshes data from real BigQuery via `/api/run-refresh-now`, and gives you a Playwright browser. `wrangler dev` runs the Worker on localhost using Miniflare — not a separate dev dashboard, just the real codebase served locally with real data.
+
+**You write the validation logic per change.** Don't just take a static full-page screenshot. Think about what would actually prove the change works:
+
+- **Added a filter?** → Screenshot with filter A, then filter B, showing the data changes
+- **Added a new chart/table?** → Screenshot zoomed into the new section showing it has data
+- **Changed a SQL query?** → Screenshot the page showing the metric changed as expected
+- **Layout change?** → Full-page screenshot showing the new arrangement
+- **Fixed a bug?** → Screenshot showing the bug is gone (and describe what it looked like before)
+
+Write a validation script inline. Example:
+
+```javascript
+import { startDashboard, getBrowser, getScreenshotDir, stopDashboard } from
+  '~/slack-agent-dashboard/scripts/validate.mjs';
+import { join } from 'path';
+
+await startDashboard();
+const browser = await getBrowser();
+const dir = getScreenshotDir();
+
+const page = await browser.newPage({ viewport: { width: 1920, height: 1080 } });
+await page.goto('http://localhost:8787/commercial/sales');
+await page.waitForTimeout(3000);
+
+// Screenshot 1: default view (Global)
+await page.screenshot({ path: join(dir, '1-sales-global.png'), fullPage: true });
+
+// Screenshot 2: EMEA filter applied — shows the filter works
+await page.click('[data-region="EMEA"]');
+await page.waitForTimeout(1500);
+await page.screenshot({ path: join(dir, '2-sales-emea.png'), fullPage: true });
+
+// Screenshot 3: close-up of the new section
+const newSection = page.locator('#my-new-section');
+await newSection.screenshot({ path: join(dir, '3-new-section-closeup.png') });
+
+await stopDashboard();
 ```
 
-The script:
-1. Starts `wrangler dev` locally (port 8787)
-2. Hits `/api/run-refresh-now` to populate KV with **real BigQuery data**
-3. Takes full-page Playwright screenshots of the specified pages
-4. Saves them to `~/slack-agent-dashboard/screenshots/`
+After running, **read each screenshot** to verify the change works correctly.
 
-Then **read each screenshot** to verify:
-- Layout renders correctly (no broken elements, no blank sections)
-- Data is populated (tables have rows, charts have data points)
-- The change you made is visible and correct
-- No regressions on the page
+Use `scripts/page-map.json` to know which pages are affected by which files.
 
-Use the page map in `scripts/page-map.json` to know which pages to screenshot based on which files you changed.
+#### e. Post screenshots to Slack for approval
 
-#### e. Push to main
-Only after validation passes:
-```bash
-cd ~/product-metrics-dashboard
-git add -A && git commit -m "description of change" && git push origin main
-```
-Push to `main` triggers the GitHub Actions deploy to Cloudflare.
+**Before pushing to main, share the validation screenshots in the Slack thread.**
 
-#### f. Reply to Slack
-Post what you changed, the validation result, and confirm it's deployed.
+1. Push the screenshots to a branch of the agent repo:
+   ```bash
+   cd ~/slack-agent-dashboard
+   git checkout -b screenshots/thread-{thread_ts}
+   git add screenshots/
+   git commit -m "validation screenshots for {brief description}"
+   git push origin screenshots/thread-{thread_ts}
+   ```
+
+2. Post to the Slack thread with:
+   - A summary of what you changed
+   - The screenshot URLs as image links (Slack unfurls these inline):
+     `https://raw.githubusercontent.com/LucasFatas/slack-agent-dashboard/screenshots/thread-{thread_ts}/screenshots/{filename}.png`
+   - A description of what each screenshot shows
+   - The question: "Does this look right? Reply 'approved' to deploy."
+
+3. **Do NOT push to main yet.** Stop here and wait for the next fire.
+
+#### f. On approval → push to main
+
+When the routine fires again from a thread reply:
+1. Read the thread — look for an approval message ("approved", "yes", "ship it", "looks good")
+2. If approved:
+   ```bash
+   cd ~/product-metrics-dashboard
+   git add -A && git commit -m "description of change" && git push origin main
+   ```
+   Reply in Slack confirming it's deployed.
+3. If not approved (corrections requested): make the changes, re-validate, post new screenshots.
+4. If the reply is unrelated to approval: treat it as a new task or follow-up question.
 
 ## Business logic decisions (DO NOT violate)
 
