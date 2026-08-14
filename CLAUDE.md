@@ -29,8 +29,27 @@ cd ~/product-metrics-dashboard  # or wherever it's cloned
 
 ## Workflow
 
-### 1. Read the Slack thread
+### 1. Read the Slack thread — the WHOLE thread, every time
 Use `slack_read_thread` with the channel and thread_ts from the fire payload.
+
+**Read the entire thread before doing anything, not just the latest message.**
+The fire payload only contains the message that triggered this run (usually the
+latest reply). The actual work is often spread across the thread:
+
+- The **parent (first) message** frequently lists the full set of requests
+  (often as a terse bullet list). Later replies add detail or context to
+  individual bullets — they do **not** replace the parent.
+- Reconcile the parent's list against the detailed replies. If the parent lists
+  three changes and a reply only elaborates on one, the other two are still in
+  scope. Map each parent bullet to a concrete change and account for all of
+  them before you reply.
+- Re-read the parent every fire, because a follow-up reply like "you missed
+  point 2" refers back to it. Never assume the triggering message is the whole
+  ask.
+
+When in doubt about scope, list back to the user exactly which items you read
+from the thread and which you're actioning — but do the ones that are clear
+rather than punting on the whole thread.
 
 ### 2. Understand what's being asked
 Two modes:
@@ -128,10 +147,26 @@ Use `scripts/page-map.json` to know which pages are affected by which files.
 
 2. Post to the Slack thread with:
    - A summary of what you changed
-   - The screenshot URLs as image links (Slack unfurls these inline):
-     `https://raw.githubusercontent.com/LucasFatas/slack-agent-dashboard/screenshots/thread-{thread_ts}/screenshots/{filename}.png`
+   - The screenshot URLs as image links. This repo is **public**, so
+     `raw.githubusercontent.com` links unfurl inline in Slack:
+     `https://raw.githubusercontent.com/LucasFatas/slack-agent-dashboard/{branch}/screenshots/{filename}.png`
    - A description of what each screenshot shows
    - The question: "Does this look right? Reply 'approved' to deploy."
+
+   **Link formatting rules (these are why links 404'd before):**
+   - Put **each** image URL on **its own line, as a bare URL** — nothing else
+     on the line. Slack auto-unfurls a bare image URL into an inline preview.
+   - **Never** wrap the URL in Slack's `<url|label>` link syntax, and **never**
+     put two URLs inside one link or on one line. Mashing URLs together (or a
+     stray newline inside `<...|...>`) produces a broken href that 404s — that
+     was the actual bug, not the branch.
+   - Use the **exact branch you pushed the screenshots to** in the path, and
+     the exact filename under `screenshots/`.
+   - **Verify each link before posting**: `curl -sS -o /dev/null -w "%{http_code}"
+     <raw-url>` must print `200`. If it doesn't, the file isn't on that branch
+     at that path — fix it before posting, don't post a guess.
+   - There is no Slack file-upload tool available via MCP, so working raw links
+     are the delivery mechanism. Get them right rather than attaching a file.
 
 3. **Do NOT push to main yet.** Stop here and wait for the next fire.
 
