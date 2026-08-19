@@ -113,9 +113,20 @@ After running, **read each screenshot** to verify the change works correctly.
 
 Use `scripts/page-map.json` to know which pages are affected by which files.
 
-#### e. Post screenshots to Slack for approval
+#### e. Persist code changes to a branch
 
-**Before pushing to main, share the validation screenshots in the Slack thread.**
+**Routine containers are ephemeral — uncommitted code is destroyed when the run ends.**
+You must commit and push the dashboard code to a named branch so the deploy run can find it.
+
+```bash
+cd ~/product-metrics-dashboard
+git checkout -b claude/thread-{thread_ts}
+git add -A
+git commit -m "feat: {brief description} [awaiting approval]"
+git push origin claude/thread-{thread_ts}
+```
+
+#### f. Post screenshots to Slack for approval
 
 1. Push the screenshots to a branch of the agent repo:
    ```bash
@@ -131,22 +142,31 @@ Use `scripts/page-map.json` to know which pages are affected by which files.
    - The screenshot URLs as image links (Slack unfurls these inline):
      `https://raw.githubusercontent.com/LucasFatas/slack-agent-dashboard/screenshots/thread-{thread_ts}/screenshots/{filename}.png`
    - A description of what each screenshot shows
+   - Mention the code is on branch `claude/thread-{thread_ts}`
    - The question: "Does this look right? Reply 'approved' to deploy."
 
 3. **Do NOT push to main yet.** Stop here and wait for the next fire.
 
-#### f. On approval → push to main
+#### g. On approval → merge to main
 
 When the routine fires again from a thread reply:
 1. Read the thread — look for an approval message ("approved", "yes", "ship it", "looks good")
-2. If approved:
+2. If approved — checkout the persisted branch and merge:
    ```bash
    cd ~/product-metrics-dashboard
-   git add -A && git commit -m "description of change" && git push origin main
+   git fetch origin
+   git checkout claude/thread-{thread_ts}
+   # Verify the code matches what was screenshotted (spot-check key files exist)
+   git checkout main
+   git merge claude/thread-{thread_ts} -m "feat: {description}"
+   git push origin main
+   # Cleanup the working branch
+   git push origin --delete claude/thread-{thread_ts}
    ```
    Reply in Slack confirming it's deployed.
-3. If not approved (corrections requested): make the changes, re-validate, post new screenshots.
+3. If not approved (corrections requested): checkout the branch, make changes, re-validate, post new screenshots, push updates to the same branch.
 4. If the reply is unrelated to approval: treat it as a new task or follow-up question.
+5. If the branch doesn't exist (previous run failed to persist): rebuild from scratch, following the full workflow from step (b).
 
 ## Business logic decisions (DO NOT violate)
 
